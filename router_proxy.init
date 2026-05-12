@@ -1,0 +1,48 @@
+#!/bin/sh /etc/rc.common
+# Router Proxy Service for OpenWrt
+
+START=99
+STOP=10
+
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+PROG_NAME=router_proxy
+APP_DIR=/root/router
+MAIN_SCRIPT="$APP_DIR/main.py"
+
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG "$MAIN_SCRIPT"
+    procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param user root
+    procd_set_param pidfile /var/run/${PROG_NAME}.pid
+    procd_set_param env PYTHONPATH="$APP_DIR"
+    procd_set_param directory "$APP_DIR"
+    procd_close_instance
+}
+
+stop_service() {
+    # More graceful stop - find and kill only our python process
+    local pid=$(pgrep -f "python3.*main.py")
+    if [ -n "$pid" ]; then
+        kill $pid
+        sleep 1
+        # Force kill if still running
+        if kill -0 $pid 2>/dev/null; then
+            kill -9 $pid
+        fi
+    fi
+}
+
+reload_service() {
+    stop
+    sleep 2
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger "router_proxy"
+}

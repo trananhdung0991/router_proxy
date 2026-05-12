@@ -1,0 +1,28 @@
+[Unit]
+Description=Router Proxy License Server
+After=network.target
+Documentation=https://github.com/your-repo/router-proxy
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/license-server
+Environment="ADMIN_TOKEN=change-me-please"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/license-server/venv/bin/python /opt/license-server/license_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=license-server
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/license-server
+
+[Install]
+WantedBy=multi-user.target

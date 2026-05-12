@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# PyArmor build output
+app/dist/
+
+# Install package
+install_package/
+
+# Node
+webUI/web/router-app/node_modules/
+webUI/web/router-app/dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+/tmp/
+
+# PyArmor license files (sensitive)
+app/pyarmor-regfile-5235.zip
+app/pyarmor.report.bug
+etc/pyarmor/pyarmor-regfile-5235.zip
+.pyarmor/
+
+# SSL certs (sensitive)
+server_lic/ssl/
+
+# package-lock (optional — remove if you want to track it)
+package-lock.json
