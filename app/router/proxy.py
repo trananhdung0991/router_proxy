@@ -68,8 +68,10 @@ class ProxyManager:
                     logger.error(f"Failed to create proxy node for {ip}")
                     return False
 
-                # Set ACL rule with remote_fakedns option
-                success = self.passwall2.set_client_proxy_rule(ip, node_section, remote_fakedns)
+                # Set ACL rule with remote_fakedns option and proxy server IP (for STUN spoofing)
+                success = self.passwall2.set_client_proxy_rule(
+                    ip, node_section, remote_fakedns, proxy_info['server']
+                )
                 if success:
                     # Save to database including remote_fakedns setting
                     self.client_proxy_db.save_client(ip, None, hostname, proxy_url, remote_fakedns, proxy_type)

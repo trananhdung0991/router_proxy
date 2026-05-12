@@ -1,10 +1,21 @@
+import os
 import subprocess
 import time
 import random
 import string
 import re
 import logging
+import threading
 from typing import Dict, List, Optional
+
+# STUN hostnames browsers use for WebRTC IP discovery
+STUN_HOSTNAMES = [
+    'stun.l.google.com', 'stun1.l.google.com', 'stun2.l.google.com',
+    'stun3.l.google.com', 'stun4.l.google.com',
+    'global.stun.twilio.com', 'stun.cloudflare.com',
+    'stun.relay.metered.ca', 'stunserver.stunprotocol.org',
+]
+_ROUTER_LAN_IP = '192.168.1.1'
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -165,6 +176,11 @@ class Passwall2Manager:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
+            # Spawn background thread to re-inject STUN DNS once passwall2 is ready
+            threading.Thread(
+                target=self._post_restart_inject_stun,
+                daemon=True, name='stun-inject'
+            ).start()
             logger.info("passwall2 safe restart initiated")
             return True
         except Exception as e:
@@ -199,7 +215,9 @@ class Passwall2Manager:
                 logger.info(f"Removing legacy Local HTTP Proxy node: {node['section']}")
                 self.remove_node(node['section'])
 
-    def set_client_proxy_rule(self, client_ip: str, node_section: str, remote_fakedns: bool = False) -> bool:
+    def set_client_proxy_rule(self, client_ip: str, node_section: str,
+                               remote_fakedns: bool = False,
+                               proxy_server_ip: str = '') -> bool:
         """Set ACL rule for client to use specific proxy node.
         Global nodes (tcp_node/udp_node) are NOT changed here — they stay
         at 'direct' so unassigned devices bypass the proxy."""
@@ -244,8 +262,15 @@ class Passwall2Manager:
             self.run_uci_command(['commit', self.config_name])
 
             logger.info(f"Remote FakeDNS: {'enabled' if remote_fakedns else 'disabled'}")
+
+            # Register device with STUN server for WebRTC IP spoofing
+            if proxy_server_ip:
+                from router.stun_server import get_stun_server
+                get_stun_server().register(client_ip, proxy_server_ip)
+                logger.info(f"STUN: registered {client_ip} → {proxy_server_ip}")
+
             logger.info(f"Restarting Passwall2 to apply rule for {client_ip}")
-            self._restart_passwall2()
+            self._restart_passwall2()  # also spawns _post_restart_inject_stun thread
 
             logger.info(f"Successfully created ACL rule for {client_ip}")
             return True
@@ -427,6 +452,15 @@ class Passwall2Manager:
                 logger.info("Restarting Passwall2 service")
                 self._restart_passwall2()
 
+            # Unregister from STUN server and remove STUN-related rules
+            try:
+                from router.stun_server import get_stun_server
+                get_stun_server().unregister(client_ip)
+            except Exception:
+                pass
+            self._remove_stun_dns(client_ip)
+            self._remove_stun_nft_rules(client_ip)
+
             logger.info(f"=== Successfully processed removal for {client_ip} ===")
             return True
         except Exception as e:
@@ -519,6 +553,246 @@ class Passwall2Manager:
         except Exception as e:
             logger.error(f"Error getting global config: {e}")
             return {}
+
+    # ------------------------------------------------------------------ #
+    #  WebRTC / STUN spoofing helpers                                     #
+    # ------------------------------------------------------------------ #
+
+    def _get_acl_dir_for_device(self, device_ip: str) -> Optional[str]:
+        """Find the passwall2 ACL runtime directory for *device_ip* by scanning
+        source_list files (which contain 'ip:<device_ip>'). Returns the dir path
+        e.g. '/var/etc/passwall2/acl/cfg1030ec', or None if not found."""
+        for base in ['/var/etc/passwall2/acl', '/tmp/etc/passwall2/acl']:
+            try:
+                for entry in os.listdir(base):
+                    src = os.path.join(base, entry, 'source_list')
+                    try:
+                        with open(src, 'r') as f:
+                            if f'ip:{device_ip}' in f.read():
+                                return os.path.join(base, entry)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return None
+
+    def _inject_stun_dns(self, device_ip: str) -> bool:
+        """Inject STUN hostname → router-IP overrides into passwall2 per-device dnsmasq
+        conf-dir and system dnsmasq (/tmp/dnsmasq.d/) as a fallback."""
+        try:
+            overrides = ('# STUN address overrides - WebRTC IP spoofing\n' +
+                         '\n'.join(f'address=/{h}/{_ROUTER_LAN_IP}' for h in STUN_HOSTNAMES) + '\n')
+            injected_perdev = False
+
+            # ── per-device dnsmasq (passwall2 ACL instance) ─────────────── #
+            acl_dir = self._get_acl_dir_for_device(device_ip)
+            if acl_dir:
+                # Read dnsmasq.conf to find the conf-dir directive
+                dnsmasq_conf = os.path.join(acl_dir, 'dnsmasq.conf')
+                conf_dir = None
+                try:
+                    with open(dnsmasq_conf, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith('conf-dir='):
+                                conf_dir = line.split('=', 1)[1]
+                                break
+                except OSError:
+                    pass
+
+                if conf_dir:
+                    os.makedirs(conf_dir, exist_ok=True)
+                    stun_conf = os.path.join(conf_dir, 'stun_override.conf')
+                    with open(stun_conf, 'w') as f:
+                        f.write(overrides)
+                    logger.info(f"STUN DNS injected into {stun_conf}")
+                    injected_perdev = True
+
+                    # Restart the per-device dnsmasq so it picks up the new conf-dir file.
+                    # (SIGHUP only reloads hosts files, not conf-dir entries.)
+                    section_id = os.path.basename(acl_dir)
+                    bin_path = f'/tmp/etc/passwall2/bin/dnsmasq_{section_id}'
+                    tmp_conf  = f'/tmp/etc/passwall2/acl/{section_id}/dnsmasq.conf'
+                    tmp_pid   = f'/tmp/etc/passwall2/acl/{section_id}/dnsmasq.pid'
+                    pid_file  = os.path.join(acl_dir, 'dnsmasq.pid')
+                    try:
+                        with open(pid_file, 'r') as f:
+                            old_pid = f.read().strip()
+                        if old_pid:
+                            subprocess.run(['kill', old_pid], capture_output=True)
+                            time.sleep(0.5)
+                        # Re-launch with same cmdline
+                        subprocess.Popen(
+                            [bin_path, '-C', tmp_conf, '-x', tmp_pid],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        logger.info(f"Restarted per-device dnsmasq ({section_id}) for {device_ip}")
+                    except OSError as exc:
+                        logger.warning(f"Could not restart per-device dnsmasq: {exc}")
+                else:
+                    logger.warning(f"No conf-dir found in {dnsmasq_conf}")
+            else:
+                logger.warning(f"No ACL dir found for {device_ip} — skipping per-device DNS injection")
+
+            # ── system dnsmasq fallback ──────────────────────────────────── #
+            subprocess.run(['mkdir', '-p', '/tmp/dnsmasq.d'], capture_output=True)
+            with open('/tmp/dnsmasq.d/stun_override.conf', 'w') as f:
+                f.write(overrides)
+            subprocess.run(
+                ['/bin/sh', '-c',
+                 'kill -HUP $(cat /var/run/dnsmasq/*.pid 2>/dev/null | head -1) 2>/dev/null; true'],
+                capture_output=True
+            )
+            logger.info(f"STUN DNS injection complete for {device_ip} (per-device={injected_perdev})")
+            return True
+        except Exception as e:
+            logger.error(f"Error injecting STUN DNS for {device_ip}: {e}")
+            return False
+
+    def _remove_stun_dns(self, device_ip: str) -> None:
+        """Remove system-wide STUN DNS overrides if no devices remain registered."""
+        try:
+            from router.stun_server import get_stun_server
+            remaining = get_stun_server().get_all()
+            if not remaining:
+                subprocess.run(['rm', '-f', '/tmp/dnsmasq.d/stun_override.conf'], capture_output=True)
+                subprocess.run(
+                    ['/bin/sh', '-c',
+                     'kill -HUP $(cat /var/run/dnsmasq/*.pid 2>/dev/null | head -1) 2>/dev/null; true'],
+                    capture_output=True
+                )
+                logger.info("STUN DNS overrides removed (no proxied devices remaining)")
+        except Exception as e:
+            logger.debug(f"_remove_stun_dns: {e}")
+
+    def _add_stun_nft_rules(self, device_ip: str) -> None:
+        """Two-step STUN interception for *device_ip*:
+        1. PSW2_MANGLE return  — prevents passwall2 tproxy from capturing STUN UDP
+        2. passwall2 dstnat redirect — sends ALL STUN UDP to the local fake STUN server
+           (works regardless of whether the browser uses DNS spoof or DoH real IP)
+        """
+        try:
+            self._remove_stun_nft_rules(device_ip)   # idempotent
+            safe_ip = device_ip.replace('.', '_')
+
+            # Step 1: bypass tproxy in PSW2_MANGLE (mangle hook priority -151)
+            #   Insert at the beginning so it fires before the catch-all tproxy rule.
+            #   Include port 19302 (Google STUN default used by Chrome WebRTC).
+            bypass_cmd = (
+                f"nft insert rule inet passwall2 PSW2_MANGLE "
+                f"ip saddr {device_ip} udp dport '{{ 3478, 3479, 5349, 19302 }}' "
+                f"return comment '\"stun_bypass_{safe_ip}\"'"
+            )
+            r = subprocess.run(['/bin/sh', '-c', bypass_cmd], capture_output=True, text=True)
+            if r.returncode == 0:
+                logger.info(f"nftables STUN tproxy bypass added for {device_ip}")
+            else:
+                logger.warning(f"nft STUN bypass failed for {device_ip}: {r.stderr.strip()}")
+
+            # Step 2: DNAT all STUN UDP from device → local fake STUN server :3478
+            #   Fires in nat prerouting (dstnat-1 = -101), after mangle.
+            #   Works for any destination IP: DNS-spoofed (192.168.1.1) OR real STUN IPs.
+            redir_cmd = (
+                f"nft insert rule inet passwall2 dstnat "
+                f"ip saddr {device_ip} udp dport '{{ 3478, 3479, 19302 }}' "
+                f"redirect to :3478 comment '\"stun_redir_{safe_ip}\"'"
+            )
+            r = subprocess.run(['/bin/sh', '-c', redir_cmd], capture_output=True, text=True)
+            if r.returncode == 0:
+                logger.info(f"nftables STUN redirect to :3478 added for {device_ip}")
+            else:
+                logger.warning(f"nft STUN redirect failed for {device_ip}: {r.stderr.strip()}")
+
+            # Defense-in-depth: drop remaining STUN-related ports in fw4 forward
+            drop_cmd = (
+                f"nft add rule inet fw4 forward "
+                f"ip saddr {device_ip} "
+                f"udp dport '{{ 5349 }}' "
+                f"drop comment '\"stun_drop_{safe_ip}\"'"
+            )
+            r = subprocess.run(['/bin/sh', '-c', drop_cmd], capture_output=True, text=True)
+            if r.returncode == 0:
+                logger.info(f"nftables STUN DROP rules added for {device_ip}")
+        except Exception as e:
+            logger.error(f"Error adding STUN nft rules for {device_ip}: {e}")
+
+    def _remove_stun_nft_rules(self, device_ip: str) -> None:
+        """Remove all STUN nft rules for *device_ip* (bypass, redirect, drop)."""
+        try:
+            safe_ip = device_ip.replace('.', '_')
+            # (table_family, table_name, chain, comment_substring)
+            targets = [
+                ('inet', 'passwall2', 'PSW2_MANGLE', f'stun_bypass_{safe_ip}'),
+                ('inet', 'passwall2', 'dstnat',       f'stun_redir_{safe_ip}'),
+                ('inet', 'fw4',       'forward',      f'stun_drop_{safe_ip}'),
+                ('inet', 'fw4',       'forward',      f'stun_{safe_ip}'),  # legacy
+            ]
+            for family, table, chain, comment in targets:
+                handles_out = subprocess.run(
+                    ['/bin/sh', '-c',
+                     f"nft -a list chain {family} {table} {chain} 2>/dev/null "
+                     f"| grep '{comment}' | awk '{{print $NF}}'"],
+                    capture_output=True, text=True
+                ).stdout.strip()
+                for handle in handles_out.splitlines():
+                    handle = handle.strip()
+                    if handle:
+                        subprocess.run(
+                            ['nft', 'delete', 'rule', family, table, chain, 'handle', handle],
+                            capture_output=True
+                        )
+            logger.info(f"nftables STUN rules removed for {device_ip}")
+        except Exception as e:
+            logger.debug(f"_remove_stun_nft_rules({device_ip}): {e}")
+
+    def _wait_for_passwall2_ready(self, timeout: int = 90) -> bool:
+        """Poll /var/log/passwall2.log for 'Running complete!' written after the
+        current restart.  Returns True when passwall2 signals it is ready."""
+        log_path = '/var/log/passwall2.log'
+        # Record current log size so we only scan new content
+        try:
+            baseline = int(
+                subprocess.run(['wc', '-c', log_path], capture_output=True, text=True)
+                .stdout.split()[0]
+            )
+        except Exception:
+            baseline = 0
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                chunk = subprocess.run(
+                    ['/bin/sh', '-c', f'tail -c +{baseline} {log_path} 2>/dev/null'],
+                    capture_output=True, text=True
+                ).stdout
+                if 'Running complete!' in chunk:
+                    logger.info("passwall2 is ready (Running complete!)")
+                    return True
+            except Exception:
+                pass
+        logger.warning("Timed out waiting for passwall2 to be ready")
+        return False
+
+    def _post_restart_inject_stun(self) -> None:
+        """Background thread: wait for passwall2 to finish, then re-inject STUN DNS
+        and nftables DROP rules for every currently registered device."""
+        try:
+            from router.stun_server import get_stun_server
+            devices = get_stun_server().get_all()   # snapshot: {device_ip: proxy_ip}
+            if not devices:
+                return  # nothing to do
+
+            if not self._wait_for_passwall2_ready():
+                logger.warning("STUN post-restart injection skipped (passwall2 not ready)")
+                return
+
+            for device_ip in devices:
+                logger.info(f"Post-restart: injecting STUN DNS + nft rules for {device_ip}")
+                self._inject_stun_dns(device_ip)
+                self._add_stun_nft_rules(device_ip)
+        except Exception as e:
+            logger.error(f"_post_restart_inject_stun: {e}")
 
     def ensure_valid_main_nodes(self) -> bool:
         """Ensure main TCP/UDP nodes are set to valid existing nodes"""
