@@ -8,6 +8,37 @@ import logging
 import threading
 from typing import Dict, List, Optional
 
+# Known DoH (DNS-over-HTTPS) resolver IPs — block these per-device to prevent
+# Chrome/Firefox bypassing the per-device dnsmasq via encrypted HTTPS DNS.
+DOH_BLOCK_IPS = [
+    '8.8.8.8', '8.8.4.4',           # Google
+    '1.1.1.1', '1.0.0.1',           # Cloudflare
+    '9.9.9.9', '149.112.112.112',    # Quad9
+    '208.67.222.222', '208.67.220.220',  # OpenDNS
+]
+
+# DoH endpoint hostnames — poison these in per-device dnsmasq (return 0.0.0.0)
+# so browsers cannot resolve the DoH server and fall back to plain UDP 53.
+# Chrome uses chrome.cloudflare-dns.com (resolves to 162.158.x, 172.x.x.x, etc.)
+# which are NOT in DOH_BLOCK_IPS, so hostname poisoning is the effective method.
+DOH_HOSTNAMES = [
+    # Google
+    'dns.google', 'dns.google.com',
+    # Cloudflare (Chrome, Firefox, Mozilla)
+    'cloudflare-dns.com', 'chrome.cloudflare-dns.com', 'mozilla.cloudflare-dns.com',
+    '1dot1dot1dot1.cloudflare-dns.com',
+    # Quad9
+    'dns.quad9.net', 'dns10.quad9.net', 'dns11.quad9.net',
+    # OpenDNS
+    'doh.opendns.com', 'doh.familyshield.opendns.com',
+    # Others
+    'dns.adguard.com', 'dns-family.adguard.com',
+    'doh.cleanbrowsing.org',
+    'doh.dns.apple.com',
+    'dns.nextdns.io',
+    'doh.xfinity.com',
+]
+
 # STUN hostnames browsers use for WebRTC IP discovery
 STUN_HOSTNAMES = [
     'stun.l.google.com', 'stun1.l.google.com', 'stun2.l.google.com',
@@ -460,6 +491,7 @@ class Passwall2Manager:
                 pass
             self._remove_stun_dns(client_ip)
             self._remove_stun_nft_rules(client_ip)
+            self._remove_doh_block_rules(client_ip)
 
             logger.info(f"=== Successfully processed removal for {client_ip} ===")
             return True
@@ -577,11 +609,18 @@ class Passwall2Manager:
         return None
 
     def _inject_stun_dns(self, device_ip: str) -> bool:
-        """Inject STUN hostname → router-IP overrides into passwall2 per-device dnsmasq
-        conf-dir and system dnsmasq (/tmp/dnsmasq.d/) as a fallback."""
+        """Inject STUN hostname overrides and DoH hostname poison into the per-device
+        dnsmasq conf-dir and system dnsmasq (/tmp/dnsmasq.d/) as a fallback.
+        - STUN hostnames → router LAN IP (WebRTC spoofing)
+        - DoH hostnames  → 0.0.0.0 (forces browser DoH fallback to plain UDP 53)"""
         try:
-            overrides = ('# STUN address overrides - WebRTC IP spoofing\n' +
-                         '\n'.join(f'address=/{h}/{_ROUTER_LAN_IP}' for h in STUN_HOSTNAMES) + '\n')
+            # Single conf block: STUN spoofing + DoH endpoint poisoning
+            stun_overrides = (
+                '# STUN address overrides - WebRTC IP spoofing\n' +
+                '\n'.join(f'address=/{h}/{_ROUTER_LAN_IP}' for h in STUN_HOSTNAMES) + '\n' +
+                '# DoH endpoint poisoning - return 0.0.0.0 so browsers fall back to plain UDP 53\n' +
+                '\n'.join(f'address=/{h}/0.0.0.0' for h in DOH_HOSTNAMES) + '\n'
+            )
             injected_perdev = False
 
             # ── per-device dnsmasq (passwall2 ACL instance) ─────────────── #
@@ -604,8 +643,8 @@ class Passwall2Manager:
                     os.makedirs(conf_dir, exist_ok=True)
                     stun_conf = os.path.join(conf_dir, 'stun_override.conf')
                     with open(stun_conf, 'w') as f:
-                        f.write(overrides)
-                    logger.info(f"STUN DNS injected into {stun_conf}")
+                        f.write(stun_overrides)
+                    logger.info(f"STUN+DoH DNS injected into {stun_conf}")
                     injected_perdev = True
 
                     # Restart the per-device dnsmasq so it picks up the new conf-dir file.
@@ -637,7 +676,7 @@ class Passwall2Manager:
             # ── system dnsmasq fallback ──────────────────────────────────── #
             subprocess.run(['mkdir', '-p', '/tmp/dnsmasq.d'], capture_output=True)
             with open('/tmp/dnsmasq.d/stun_override.conf', 'w') as f:
-                f.write(overrides)
+                f.write(stun_overrides)
             subprocess.run(
                 ['/bin/sh', '-c',
                  'kill -HUP $(cat /var/run/dnsmasq/*.pid 2>/dev/null | head -1) 2>/dev/null; true'],
@@ -716,6 +755,58 @@ class Passwall2Manager:
         except Exception as e:
             logger.error(f"Error adding STUN nft rules for {device_ip}: {e}")
 
+    def _add_doh_block_rules(self, device_ip: str) -> None:
+        """Block DoH (DNS-over-HTTPS port 443) to known resolver IPs for *device_ip*.
+        Rules are inserted into PSW2_MANGLE (prerouting mangle, priority -151), BEFORE
+        the passwall2 catch-all TPROXY rule.  If placed in fw4 forward instead, they
+        never fire because TPROXY already consumes the packets in prerouting.
+        Dropping here forces Chrome/Firefox to fall back to plain UDP 53, which
+        passwall2 redirects to the per-device dnsmasq → proxy DNS."""
+        try:
+            self._remove_doh_block_rules(device_ip)
+            safe_ip = device_ip.replace('.', '_')
+            doh_set = '{ ' + ', '.join(DOH_BLOCK_IPS) + ' }'
+            # Drop TCP 443 (HTTPS DoH) and UDP 443 (QUIC/HTTP3 DoH) in PSW2_MANGLE
+            # so the packets are discarded before xray TPROXY intercepts them.
+            for proto in ('tcp', 'udp'):
+                cmd = (
+                    f"nft insert rule inet passwall2 PSW2_MANGLE "
+                    f"ip saddr {device_ip} ip daddr '{doh_set}' "
+                    f"{proto} dport 443 drop comment '\"doh_block_{safe_ip}\"'"
+                )
+                r = subprocess.run(['/bin/sh', '-c', cmd], capture_output=True, text=True)
+                if r.returncode != 0:
+                    logger.warning(f"nft DoH block ({proto}) in PSW2_MANGLE failed for {device_ip}: {r.stderr.strip()}")
+            logger.info(f"DoH block rules added in PSW2_MANGLE for {device_ip}")
+        except Exception as e:
+            logger.error(f"Error adding DoH block rules for {device_ip}: {e}")
+
+    def _remove_doh_block_rules(self, device_ip: str) -> None:
+        """Remove DoH block nft rules for *device_ip* from PSW2_MANGLE and fw4 forward."""
+        try:
+            safe_ip = device_ip.replace('.', '_')
+            comment = f'doh_block_{safe_ip}'
+            # Clean from PSW2_MANGLE (current location) and fw4 forward (legacy location)
+            for family, table, chain in [
+                ('inet', 'passwall2', 'PSW2_MANGLE'),
+                ('inet', 'fw4', 'forward'),
+            ]:
+                handles_out = subprocess.run(
+                    ['/bin/sh', '-c',
+                     f"nft -a list chain {family} {table} {chain} 2>/dev/null "
+                     f"| grep '{comment}' | awk '{{print $NF}}'"],
+                    capture_output=True, text=True
+                ).stdout.strip()
+                for handle in handles_out.splitlines():
+                    handle = handle.strip()
+                    if handle:
+                        subprocess.run(
+                            ['nft', 'delete', 'rule', family, table, chain, 'handle', handle],
+                            capture_output=True
+                        )
+        except Exception as e:
+            logger.debug(f"_remove_doh_block_rules({device_ip}): {e}")
+
     def _remove_stun_nft_rules(self, device_ip: str) -> None:
         """Remove all STUN nft rules for *device_ip* (bypass, redirect, drop)."""
         try:
@@ -774,10 +865,232 @@ class Passwall2Manager:
         logger.warning("Timed out waiting for passwall2 to be ready")
         return False
 
+    def _get_device_remote_fakedns(self, device_ip: str) -> bool:
+        """Return True if remote_fakedns (Use proxy DNS) is enabled for this device."""
+        try:
+            cfg = self.run_uci_command(['show', self.config_name])
+            current_section = None
+            section_ip = None
+            section_fakedns = False
+            for line in cfg.splitlines():
+                if '=acl_rule' in line:
+                    if current_section and section_ip == device_ip:
+                        return section_fakedns
+                    current_section = line.split('=')[0].split('.', 1)[1]
+                    section_ip = None
+                    section_fakedns = False
+                elif current_section:
+                    if f'.{current_section}.sources=' in line:
+                        section_ip = line.split('=', 1)[1].strip().strip('\'"')
+                    elif f'.{current_section}.remote_fakedns=' in line:
+                        section_fakedns = line.split('=', 1)[1].strip().strip('\'"') == '1'
+            if current_section and section_ip == device_ip:
+                return section_fakedns
+        except Exception as e:
+            logger.debug(f"_get_device_remote_fakedns({device_ip}): {e}")
+        return False
+
+    def _patch_xray_dns_through_proxy(self, device_ip: str) -> bool:
+        """Patch the xray JSON config for device_ip so the original hostname is
+        preserved end-to-end into the HTTP CONNECT request.  3proxy on the proxy
+        server then resolves the hostname using its carrier (dongle) DNS, so
+        browserleaks.com/dns shows only the carrier DNS.
+
+        Strategy:
+        1. Find the xray JSON whose dns-in inbound port matches the per-device
+           dnsmasq upstream port (e.g. 11301).
+        2. Set routing.domainStrategy = "AsIs" so xray does not resolve at routing
+           time.
+        3. On every inbound: enable sniffing with destOverride
+           ["http","tls","fakedns","quic"], metadataOnly=false, routeOnly=false so
+           the original hostname is recovered from FakeDNS / SNI / Host header and
+           used as the destination.
+        4. On the HTTP proxy outbound: ensure no domainStrategy: "UseIP*" leaks
+           through (force "AsIs").
+        5. Restore dns-out to its safe default (UDP 8.8.8.8 via direct, with
+           hijack rules) in case a previous broken patch left it routed through
+           the proxy.
+        6. Kill + restart that xray process with the patched config."""
+        try:
+            import json as _json
+
+            # Find the per-device dnsmasq upstream port
+            acl_dir = self._get_acl_dir_for_device(device_ip)
+            if not acl_dir:
+                logger.warning(f"_patch_xray_dns: no ACL dir for {device_ip}")
+                return False
+            dnsmasq_conf = os.path.join(acl_dir, 'dnsmasq.conf')
+            dns_port = None
+            try:
+                with open(dnsmasq_conf) as f:
+                    for line in f:
+                        m = re.match(r'server=127\.0\.0\.1#(\d+)', line.strip())
+                        if m:
+                            dns_port = int(m.group(1))
+                            break
+            except OSError:
+                pass
+            if not dns_port:
+                logger.warning(f"_patch_xray_dns: cannot find dnsmasq upstream port for {device_ip}")
+                return False
+
+            # Find the xray JSON that owns this dns-in inbound port
+            xray_json_dir = '/tmp/etc/passwall2/acl'
+            target_json = None
+            try:
+                for fname in os.listdir(xray_json_dir):
+                    if not fname.endswith('.json'):
+                        continue
+                    fpath = os.path.join(xray_json_dir, fname)
+                    try:
+                        with open(fpath) as f:
+                            cfg = _json.load(f)
+                        for ib in cfg.get('inbounds', []):
+                            if ib.get('tag') == 'dns-in' and ib.get('port') == dns_port:
+                                target_json = fpath
+                                break
+                    except Exception:
+                        pass
+                    if target_json:
+                        break
+            except OSError:
+                pass
+
+            if not target_json:
+                logger.warning(f"_patch_xray_dns: no xray JSON with dns-in port {dns_port}")
+                return False
+
+            with open(target_json) as f:
+                cfg = _json.load(f)
+
+            # 1. routing.domainStrategy = AsIs
+            cfg.setdefault('routing', {})['domainStrategy'] = 'AsIs'
+
+            # 2. Enable hostname sniffing on all non-dns-in inbounds
+            for ib in cfg.get('inbounds', []):
+                if ib.get('tag') == 'dns-in':
+                    continue
+                ib['sniffing'] = {
+                    'enabled': True,
+                    'destOverride': ['http', 'tls', 'fakedns', 'quic'],
+                    'metadataOnly': False,
+                    'routeOnly': False,
+                }
+
+            # 3. Force domainStrategy=AsIs on every non-direct/blackhole/dns outbound
+            #    and revert any previous proxySettings on dns-out.
+            for ob in cfg.get('outbounds', []):
+                proto = ob.get('protocol', '')
+                tag = ob.get('tag', '')
+                if tag == 'dns-out':
+                    # Revert to safe defaults: UDP DNS direct with hijack rules
+                    ob['settings'] = {
+                        'port': 53,
+                        'network': 'udp',
+                        'address': '8.8.8.8',
+                        'rules': [
+                            {'qtype': '1,28', 'action': 'hijack'},
+                            {'qtype': 65, 'action': 'reject'},
+                            {'action': 'direct'},
+                        ],
+                    }
+                    ob['proxySettings'] = {'tag': 'direct'}
+                    continue
+                if proto in ('freedom', 'blackhole', 'dns'):
+                    continue
+                # Proxy outbound: force AsIs so xray does not resolve hostname locally
+                settings = ob.setdefault('settings', {})
+                settings['domainStrategy'] = 'AsIs'
+
+            # Write patched config
+            with open(target_json, 'w') as f:
+                _json.dump(cfg, f)
+
+            # Kill old xray process for this config and restart it
+            basename = os.path.basename(target_json)
+            result = subprocess.run(
+                ['/bin/sh', '-c',
+                 f"ps | grep xray | grep '{basename}' | grep -v grep | awk '{{print $1}}'"],
+                capture_output=True, text=True
+            )
+            for pid in result.stdout.strip().splitlines():
+                pid = pid.strip()
+                if pid:
+                    subprocess.run(['kill', pid], capture_output=True)
+            time.sleep(0.8)
+
+            xray_bin = '/tmp/etc/passwall2/bin/xray'
+            subprocess.Popen(
+                [xray_bin, 'run', '-c', target_json],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            logger.info(f"DNS patched through proxy for {device_ip} (port {dns_port}, sniffing+AsIs)")
+            return True
+        except Exception as e:
+            logger.error(f"_patch_xray_dns_through_proxy({device_ip}): {e}")
+            return False
+
+    def _disable_lan_ipv6(self) -> bool:
+        """Disable IPv6 on the LAN entirely: turn off DHCPv6 + RA, drop the LAN
+        IPv6 address, and block IPv6 forwarding through the firewall.  Without
+        this, IPv6 traffic from LAN devices bypasses passwall2's IPv4-only
+        TPROXY and leaks DNS / IPs through the router's WAN6 path."""
+        try:
+            changed = False
+            checks = [
+                ('dhcp.lan.dhcpv6', 'disabled'),
+                ('dhcp.lan.ra', 'disabled'),
+                ('dhcp.lan.ndp', 'disabled'),
+            ]
+            for key, value in checks:
+                cur = subprocess.run(['uci', 'get', key],
+                                     capture_output=True, text=True).stdout.strip()
+                if cur != value:
+                    subprocess.run(['uci', 'set', f'{key}={value}'], check=False)
+                    changed = True
+            # Remove IPv6 address from LAN interface so devices don't autoconf via it
+            cur_ip6 = subprocess.run(['uci', 'get', 'network.lan.ip6assign'],
+                                     capture_output=True, text=True).stdout.strip()
+            if cur_ip6:
+                subprocess.run(['uci', 'delete', 'network.lan.ip6assign'], check=False)
+                changed = True
+            cur_ipaddr6 = subprocess.run(['uci', 'get', 'network.lan.ipaddr6'],
+                                         capture_output=True, text=True).stdout.strip()
+            if cur_ipaddr6:
+                subprocess.run(['uci', 'delete', 'network.lan.ipaddr6'], check=False)
+                changed = True
+            if changed:
+                subprocess.run(['uci', 'commit', 'dhcp'], check=False)
+                subprocess.run(['uci', 'commit', 'network'], check=False)
+                subprocess.run(['/etc/init.d/odhcpd', 'reload'],
+                               capture_output=True)
+                subprocess.run(['/etc/init.d/dnsmasq', 'reload'],
+                               capture_output=True)
+                logger.info("LAN IPv6 disabled (dhcpv6/ra/ndp off)")
+
+            # Runtime: drop existing IPv6 address from br-lan and disable IPv6 in kernel
+            subprocess.run(['/bin/sh', '-c',
+                            "ip -6 addr flush dev br-lan scope global 2>/dev/null"],
+                           capture_output=True)
+            subprocess.run(['sysctl', '-w',
+                            'net.ipv6.conf.br-lan.disable_ipv6=1'],
+                           capture_output=True)
+            subprocess.run(['sysctl', '-w',
+                            'net.ipv6.conf.br-lan.accept_ra=0'],
+                           capture_output=True)
+            return True
+        except Exception as e:
+            logger.error(f"_disable_lan_ipv6: {e}")
+            return False
+
     def _post_restart_inject_stun(self) -> None:
         """Background thread: wait for passwall2 to finish, then re-inject STUN DNS
         and nftables DROP rules for every currently registered device."""
         try:
+            # Disable LAN IPv6 so devices can't leak DNS/traffic via WAN6 path
+            self._disable_lan_ipv6()
+
             from router.stun_server import get_stun_server
             devices = get_stun_server().get_all()   # snapshot: {device_ip: proxy_ip}
             if not devices:
@@ -791,6 +1104,10 @@ class Passwall2Manager:
                 logger.info(f"Post-restart: injecting STUN DNS + nft rules for {device_ip}")
                 self._inject_stun_dns(device_ip)
                 self._add_stun_nft_rules(device_ip)
+                self._add_doh_block_rules(device_ip)
+                if self._get_device_remote_fakedns(device_ip):
+                    logger.info(f"Post-restart: patching xray DNS through proxy for {device_ip}")
+                    self._patch_xray_dns_through_proxy(device_ip)
         except Exception as e:
             logger.error(f"_post_restart_inject_stun: {e}")
 

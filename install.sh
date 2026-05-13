@@ -140,6 +140,22 @@ uci set uhttpd.router_app.index_page='index.html'
 uci commit uhttpd
 /etc/init.d/uhttpd restart
 
+# Disable LAN IPv6 to prevent DNS/traffic leaks bypassing passwall2's IPv4-only TPROXY
+echo "Disabling LAN IPv6 to prevent leaks..."
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ra='disabled'
+uci set dhcp.lan.ndp='disabled'
+uci -q delete network.lan.ip6assign
+uci -q delete network.lan.ipaddr6
+uci commit dhcp
+uci commit network
+ip -6 addr flush dev br-lan scope global 2>/dev/null
+sysctl -w net.ipv6.conf.br-lan.disable_ipv6=1 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.br-lan.accept_ra=0 >/dev/null 2>&1
+/etc/init.d/odhcpd reload 2>/dev/null
+/etc/init.d/dnsmasq reload 2>/dev/null
+echo "LAN IPv6 disabled"
+
 echo ""
 echo "=== Installation Complete ==="
 echo "Python API is running on port 8080"
