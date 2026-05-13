@@ -19,16 +19,17 @@ def restore_stun_registrations():
     # --- 1. Try DB ---
     try:
         from router.db.db_init import DBInit
-        from urllib.parse import urlparse
         db = DBInit()
         clients = db.clients_db.get_all_clients()
         for ip, data in clients.items():
-            proxy_url = data.get('proxy_url', '')
-            if proxy_url:
-                parsed = urlparse(proxy_url)
-                if parsed.hostname:
-                    stun.register(ip, parsed.hostname)
-                    count += 1
+            proxy_url = data.get('proxy_url', '') or data.get('proxy', '')
+            exit_ip = data.get('exit_ip', '')
+            if not exit_ip and proxy_url:
+                from urllib.parse import urlparse
+                exit_ip = urlparse(proxy_url).hostname or ''
+            if proxy_url and exit_ip:
+                stun.register(ip, exit_ip)
+                count += 1
     except Exception as e:
         logger.debug(f"DB restore skipped: {e}")
 

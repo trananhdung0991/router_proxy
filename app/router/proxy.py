@@ -7,6 +7,7 @@ import json
 import time
 import os
 import logging
+import requests
 from .db.clients import ClientsDB  # This should now work
 
 # Set up logging
@@ -31,8 +32,30 @@ class ProxyManager:
         self.proxy_rules = {}
         self.active_proxies = {}
 
-    def set_client_proxy(self, ip: str, proxy_url: str, hostname: str = '', remote_fakedns: bool = False, proxy_type: str = 'HTTP') -> bool:
-        """Set proxy for client with optional remote_fakedns"""
+    def _resolve_exit_ip(self, proxy_url: str) -> str:
+        """Query the actual public exit IP through the proxy (non-blocking, 5s timeout).
+        Falls back to the proxy server host on failure."""
+        try:
+            resp = requests.get(
+                'https://api.ipify.org',
+                proxies={'http': proxy_url, 'https': proxy_url},
+                timeout=5
+            )
+            ip = resp.text.strip()
+            if ip:
+                logger.info(f"Resolved exit IP via proxy: {ip}")
+                return ip
+        except Exception as e:
+            logger.debug(f"Exit IP probe failed ({e}), falling back to proxy host")
+        # Fallback: use proxy server address
+        try:
+            parsed = urlparse(proxy_url)
+            return parsed.hostname or ''
+        except Exception:
+            return ''
+
+    def set_client_proxy(self, ip: str, proxy_url: str, hostname: str = '', remote_fakedns: bool = False, proxy_type: str = 'HTTP', exit_ip: str = '') -> bool:
+        """Set proxy for client with optional remote_fakedns. exit_ip overrides auto-resolve."""
         try:
             if not proxy_url or proxy_url.strip() == "":
                 # Remove proxy
@@ -68,14 +91,19 @@ class ProxyManager:
                     logger.error(f"Failed to create proxy node for {ip}")
                     return False
 
-                # Set ACL rule with remote_fakedns option and proxy server IP (for STUN spoofing)
+                # Resolve real exit IP through proxy for accurate WebRTC spoofing
+                # If caller provided exit_ip explicitly, use it; otherwise auto-resolve
+                if not exit_ip:
+                    exit_ip = self._resolve_exit_ip(proxy_url)
+
+                # Set ACL rule with remote_fakedns option and proxy exit IP (for STUN spoofing)
                 success = self.passwall2.set_client_proxy_rule(
-                    ip, node_section, remote_fakedns, proxy_info['server']
+                    ip, node_section, remote_fakedns, exit_ip
                 )
                 if success:
-                    # Save to database including remote_fakedns setting
-                    self.client_proxy_db.save_client(ip, None, hostname, proxy_url, remote_fakedns, proxy_type)
-                    logger.info(f"Successfully saved to database: {ip} -> {proxy_url}, remote_fakedns: {remote_fakedns}")
+                    # Save to database including remote_fakedns setting and resolved exit IP
+                    self.client_proxy_db.save_client(ip, None, hostname, proxy_url, remote_fakedns, proxy_type, exit_ip)
+                    logger.info(f"Successfully saved to database: {ip} -> {proxy_url}, exit_ip: {exit_ip}, remote_fakedns: {remote_fakedns}")
                 
                 return success
 

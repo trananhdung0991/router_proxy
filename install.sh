@@ -19,6 +19,136 @@ else
     exit 1
 fi
 
+# Set up extroot overlay on x86/x86_64:
+#   - Fix GPT backup header to end of disk
+#   - Create sda3 (or next free partition) in the free space
+#   - Format ext4, copy /overlay, configure fstab extroot
+#   - Reboot so next boot mounts the large overlay
+# Returns 0 if extroot already active or not x86, exits 1 to reboot.
+setup_extroot_x86() {
+    ARCH=$(uname -m)
+    if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "i686" ] && [ "$ARCH" != "x86" ]; then
+        return 0
+    fi
+
+    # Find root device + disk
+    ROOT_DEV=$(mount | awk '$3=="/"{print $1}' | head -1)
+    case "$ROOT_DEV" in
+        /dev/sd[a-z][0-9]*) DISK=${ROOT_DEV%%[0-9]*} ;;
+        /dev/vd[a-z][0-9]*) DISK=${ROOT_DEV%%[0-9]*} ;;
+        *) return 0 ;;
+    esac
+
+    # If overlay is already a separate large partition, nothing to do
+    OVERLAY_DEV=$(mount | awk '$3=="/overlay"{print $1}' | head -1)
+    if [ -n "$OVERLAY_DEV" ] && [ "$OVERLAY_DEV" != "$ROOT_DEV" ]; then
+        OVERLAY_KB=$(df -k /overlay | awk 'NR==2{print $2}')
+        if [ "$OVERLAY_KB" -gt 524288 ]; then
+            echo "Extroot already active on $OVERLAY_DEV (${OVERLAY_KB}KB), skipping setup"
+            return 0
+        fi
+    fi
+
+    echo "Setting up extroot overlay on $DISK..."
+
+    # Install tools
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        apk add --allow-untrusted gdisk e2fsprogs block-mount bash 2>/dev/null || true
+    else
+        opkg install gdisk e2fsprogs block-mount 2>/dev/null || true
+    fi
+
+    if ! command -v gdisk > /dev/null 2>&1; then
+        echo "Warning: gdisk not available, skipping extroot setup"
+        return 0
+    fi
+
+    # Determine next free partition number
+    LAST_PART=$(gdisk -l "$DISK" 2>/dev/null | awk '/^[[:space:]]*[0-9]/{print $1}' | grep -v '^128$' | sort -n | tail -1)
+    OVERLAY_PARTNUM=$((LAST_PART + 1))
+    OVERLAY_DEV_NEW="${DISK}${OVERLAY_PARTNUM}"
+
+    # If target partition already exists and is large, it was pre-created — just use it
+    if [ -b "$OVERLAY_DEV_NEW" ]; then
+        PART_KB=$(( $(cat /sys/class/block/$(basename $OVERLAY_DEV_NEW)/size 2>/dev/null || echo 0) / 2 ))
+        if [ "$PART_KB" -gt 524288 ]; then
+            echo "$OVERLAY_DEV_NEW already exists and is large, formatting for overlay"
+        else
+            echo "$OVERLAY_DEV_NEW exists but is small, skip extroot"
+            return 0
+        fi
+    else
+        # Fix GPT backup header to end of disk so free space is visible
+        echo "Fixing GPT backup header and creating $OVERLAY_DEV_NEW..."
+        {
+            printf "x\ne\nw\nY\n"
+        } | gdisk "$DISK" > /dev/null 2>&1 || true
+
+        # Check free space exists now
+        FREE=$(gdisk -l "$DISK" 2>/dev/null | grep "^Total free space" | awk '{print $4}')
+        if [ -z "$FREE" ] || [ "$FREE" -lt 1048576 ]; then
+            echo "Not enough free space on $DISK for extroot, skipping"
+            return 0
+        fi
+
+        # Create overlay partition in free space
+        {
+            printf "n\n%s\n\n\n8300\nw\nY\n" "$OVERLAY_PARTNUM"
+        } | gdisk "$DISK" > /dev/null 2>&1
+
+        # Rescan partition table
+        partprobe "$DISK" 2>/dev/null || true
+        sleep 2
+
+        if [ ! -b "$OVERLAY_DEV_NEW" ]; then
+            echo "Warning: $OVERLAY_DEV_NEW not visible after partitioning, skipping extroot"
+            return 0
+        fi
+    fi
+
+    echo "Formatting $OVERLAY_DEV_NEW as ext4..."
+    mkfs.ext4 -L overlay "$OVERLAY_DEV_NEW" 2>&1
+
+    echo "Copying current overlay to $OVERLAY_DEV_NEW..."
+    mkdir -p /mnt/overlay
+    mount "$OVERLAY_DEV_NEW" /mnt/overlay
+    tar -C /overlay -cf - . | tar -C /mnt/overlay -xf - 2>/dev/null
+    umount /mnt/overlay
+
+    # Get UUID via tune2fs (blkid may not be available)
+    OVERLAY_UUID=$(tune2fs -l "$OVERLAY_DEV_NEW" 2>/dev/null | awk '/Filesystem UUID/{print $3}')
+    if [ -z "$OVERLAY_UUID" ]; then
+        echo "Warning: could not read UUID from $OVERLAY_DEV_NEW"
+        OVERLAY_UUID=""
+    fi
+    echo "Overlay UUID: $OVERLAY_UUID"
+
+    # Configure fstab extroot
+    uci -q delete fstab.extroot 2>/dev/null
+    uci set fstab.extroot=mount
+    uci set fstab.extroot.target=/overlay
+    if [ -n "$OVERLAY_UUID" ]; then
+        uci set fstab.extroot.uuid="$OVERLAY_UUID"
+    else
+        uci set fstab.extroot.device="$OVERLAY_DEV_NEW"
+    fi
+    uci set fstab.extroot.fstype=ext4
+    uci set fstab.extroot.options="rw,noatime"
+    uci set fstab.extroot.enabled=1
+    uci set fstab.extroot.enabled_fsck=0
+    uci commit fstab
+    /etc/init.d/fstab enable
+
+    echo ""
+    echo "=== Extroot overlay configured on $OVERLAY_DEV_NEW ==="
+    echo "Rebooting to activate overlay. Re-run install.sh after reboot to continue."
+    sleep 3
+    reboot
+    exit 0
+}
+
+setup_extroot_x86
+
 # Install Python and dependencies
 echo "Installing Python dependencies..."
 if [ "$PKG_MANAGER" = "apk" ]; then
@@ -65,15 +195,30 @@ fi
 if [ "$PKG_MANAGER" = "apk" ]; then
     # apk-based: add passwall2 repo and install
     echo "Adding Passwall2 repository for apk..."
-    PASSWALL_REPO="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$VERSION_MAJOR_MINOR/$ARCH/passwall2"
-    if ! grep -q "passwall2" /etc/apk/repositories 2>/dev/null; then
-        echo "$PASSWALL_REPO" >> /etc/apk/repositories
+    PASSWALL_REPO="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$VERSION_MAJOR_MINOR/$ARCH/passwall2/packages.adb"
+    PASSWALL_PKG_REPO="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$VERSION_MAJOR_MINOR/$ARCH/passwall_packages/packages.adb"
+    CUSTOMFEEDS="/etc/apk/repositories.d/customfeeds.list"
+    mkdir -p /etc/apk/repositories.d
+    if ! grep -q "passwall2/packages.adb" "$CUSTOMFEEDS" 2>/dev/null; then
+        echo "$PASSWALL_REPO" >> "$CUSTOMFEEDS"
     fi
-    apk update 2>/dev/null || true
+    if ! grep -q "passwall_packages/packages.adb" "$CUSTOMFEEDS" 2>/dev/null; then
+        echo "$PASSWALL_PKG_REPO" >> "$CUSTOMFEEDS"
+    fi
+    # Remove any stale bare URLs from /etc/apk/repositories
+    sed -i '/passwall2/d' /etc/apk/repositories 2>/dev/null || true
+    apk update --allow-untrusted 2>/dev/null || true
     if apk info luci-app-passwall2 > /dev/null 2>&1; then
-        echo "Passwall2 is already installed, skipping installation"
+        echo "Passwall2 is already installed"
+        # Ensure xray-core is installed even if passwall2 was already present
+        apk info xray-core > /dev/null 2>&1 || apk add --allow-untrusted xray-core || true
     else
-        apk add luci-app-passwall2 || echo "Warning: luci-app-passwall2 not available via apk, skipping"
+        # v2ray-geoip + v2ray-geosite are large (~20MB each); mount tmpfs so they
+        # don't fill the root partition during install (overlay is large but apk
+        # extracts to /usr/share/v2ray on root first if not pre-mounted)
+        mkdir -p /usr/share/v2ray
+        mount | grep -q '/usr/share/v2ray' || mount -t tmpfs -o size=400M tmpfs /usr/share/v2ray 2>/dev/null || true
+        apk add --allow-untrusted luci-app-passwall2 xray-core || echo "Warning: passwall2/xray-core not available via apk, skipping"
     fi
 else
     # opkg-based

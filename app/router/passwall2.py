@@ -100,8 +100,15 @@ class Passwall2Manager:
                         node.get('port') == str(port) and 
                         node.get('protocol') == protocol and
                         node.get('remarks') == name):
-                        logger.info(f"{protocol.upper()} node '{name}' already exists: {node['section']}")
-                        return node['section']
+                        # Update credentials in case they changed
+                        sec = node['section']
+                        if username:
+                            self.run_uci_command(['set', f'{self.config_name}.{sec}.username={username}'])
+                        if password:
+                            self.run_uci_command(['set', f'{self.config_name}.{sec}.password={password}'])
+                        self.run_uci_command(['commit', self.config_name])
+                        logger.info(f"{protocol.upper()} node '{name}' already exists: {sec} (credentials updated)")
+                        return sec
             
             # Generate a unique section name that doesn't start with 'node_'
             section_name = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -182,13 +189,13 @@ class Passwall2Manager:
 
             # Kill all child processes that stop doesn't clean up
             # Use busybox-compatible sh+ps+awk (OpenWrt has no pkill)
+            # NOTE: do NOT kill nft — passwall2 uses it to load rules and killing it causes startup to hang
             kill_patterns = ['app\\.sh', 'passwall', 'awk.*passwall', 'dnsmasq.*passwall', 'xray']
             for pattern in kill_patterns:
                 subprocess.run(
                     ['/bin/sh', '-c',
                      f"kill -9 $(ps | grep -E '{pattern}' | grep -v grep | awk '{{print $1}}') 2>/dev/null; true"],
                     capture_output=True)
-            subprocess.run(['/usr/bin/killall', '-9', 'nft'], capture_output=True)
             time.sleep(2)
 
             # Remove lock files and runtime dirs

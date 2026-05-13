@@ -38,6 +38,16 @@ class ClientsDB:
                 # Column already exists, which is fine
                 if "duplicate column name" not in str(e).lower():
                     logger.debug(f"proxy_type column migration: {e}")
+
+            # Migration: Add exit_ip column if it doesn't exist
+            try:
+                self.db.execute('''
+                    ALTER TABLE clients ADD COLUMN exit_ip TEXT DEFAULT ""
+                ''')
+                logger.info("Added exit_ip column to clients table")
+            except Exception as e:
+                if "duplicate column name" not in str(e).lower():
+                    logger.debug(f"exit_ip column migration: {e}")
             
             logger.info("Database initialized")
             
@@ -49,7 +59,7 @@ class ClientsDB:
         try:
             # Use self.db.query_all
             rows = self.db.query_all('''
-                SELECT ip, hostname, mac, proxy, proxy_type, remote_fakedns, created_at, updated_at
+                SELECT ip, hostname, mac, proxy, proxy_type, remote_fakedns, exit_ip, created_at, updated_at
                 FROM clients
             ''')
             # Convert to dictionary with IP as key
@@ -62,6 +72,7 @@ class ClientsDB:
                     'proxy': row['proxy'] or '',
                     'proxy_type': row['proxy_type'] or 'HTTP',
                     'remote_fakedns': bool(row['remote_fakedns']),
+                    'exit_ip': row['exit_ip'] or '',
                     'created_at': row['created_at'],
                     'updated_at': row['updated_at']
                 }
@@ -76,7 +87,7 @@ class ClientsDB:
         try:
             # Use self.db.query_one
             row = self.db.query_one('''
-                SELECT ip, hostname, mac, proxy, proxy_type, remote_fakedns, created_at, updated_at
+                SELECT ip, hostname, mac, proxy, proxy_type, remote_fakedns, exit_ip, created_at, updated_at
                 FROM clients
                 WHERE ip = ?
             ''', (ip,))
@@ -89,6 +100,7 @@ class ClientsDB:
                     'proxy': row['proxy'] or '',
                     'proxy_type': row['proxy_type'] or 'HTTP',
                     'remote_fakedns': bool(row['remote_fakedns']),
+                    'exit_ip': row['exit_ip'] or '',
                     'created_at': row['created_at'],
                     'updated_at': row['updated_at']
                 }
@@ -99,7 +111,7 @@ class ClientsDB:
             logger.error(f"Error getting client {ip}: {e}")
             return None
     
-    def save_client(self, ip: str, hostname: str = "", mac: str = "", proxy: str = "", remote_fakedns: bool = False, proxy_type: str = 'HTTP') -> bool:
+    def save_client(self, ip: str, hostname: str = "", mac: str = "", proxy: str = "", remote_fakedns: bool = False, proxy_type: str = 'HTTP', exit_ip: str = '') -> bool:
         """Save or update a client configuration"""
         try:
             # Use self.db.upsert_row for INSERT OR REPLACE functionality
@@ -110,6 +122,7 @@ class ClientsDB:
                 'proxy': proxy,
                 'proxy_type': proxy_type.upper() if proxy_type else 'HTTP',
                 'remote_fakedns': remote_fakedns,
+                'exit_ip': exit_ip,
                 'updated_at': 'CURRENT_TIMESTAMP'
             }
             
@@ -120,11 +133,11 @@ class ClientsDB:
                 # Fallback to manual INSERT OR REPLACE
                 self.db.execute('''
                     INSERT OR REPLACE INTO clients 
-                    (ip, hostname, mac, proxy, proxy_type, remote_fakedns, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (ip, hostname, mac, proxy, proxy_type.upper() if proxy_type else 'HTTP', remote_fakedns))
+                    (ip, hostname, mac, proxy, proxy_type, remote_fakedns, exit_ip, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (ip, hostname, mac, proxy, proxy_type.upper() if proxy_type else 'HTTP', remote_fakedns, exit_ip))
             
-            logger.info(f"Client saved: {ip} -> {proxy}")
+            logger.info(f"Client saved: {ip} -> {proxy} (exit_ip: {exit_ip})")
             return True
             
         except Exception as e:

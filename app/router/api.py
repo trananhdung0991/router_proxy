@@ -209,11 +209,12 @@ def set_client_proxy():
         proxy_type = data.get('proxy_type', 'HTTP').strip().upper()
         hostname = data.get('hostname', '').strip()
         remote_fakedns = data.get('remote_fakedns', False)
+        exit_ip = data.get('exit_ip', '').strip()
         
         if not ip:
             return jsonify({"status": False, "error": "IP address required"}), 400
         
-        success = proxy.set_client_proxy(ip, proxy_url, hostname, remote_fakedns, proxy_type)
+        success = proxy.set_client_proxy(ip, proxy_url, hostname, remote_fakedns, proxy_type, exit_ip)
         
         if success:
             if proxy_url:
@@ -237,6 +238,30 @@ def set_client_proxy():
         else:
             return jsonify({"status": False, "error": "Failed to configure proxy"}), 500
             
+    except Exception as e:
+        return jsonify({"status": False, "error": str(e)}), 500
+
+@app.route("/stun/register", methods=["POST"])
+def stun_register():
+    """Directly register a device IP → proxy exit IP in the fake STUN server"""
+    try:
+        from router.stun_server import get_stun_server
+        data = request.get_json() or {}
+        ip = data.get('ip', '').strip()
+        proxy_ip = data.get('proxy_ip', '').strip()
+        if not ip or not proxy_ip:
+            return jsonify({"status": False, "error": "ip and proxy_ip required"}), 400
+        get_stun_server().register(ip, proxy_ip)
+        return jsonify({"status": True, "message": f"STUN registered {ip} -> {proxy_ip}"})
+    except Exception as e:
+        return jsonify({"status": False, "error": str(e)}), 500
+
+@app.route("/stun/registrations", methods=["GET"])
+def stun_registrations():
+    """List all STUN device registrations"""
+    try:
+        from router.stun_server import get_stun_server
+        return jsonify({"status": True, "data": get_stun_server().get_all()})
     except Exception as e:
         return jsonify({"status": False, "error": str(e)}), 500
 
