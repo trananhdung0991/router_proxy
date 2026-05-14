@@ -262,9 +262,21 @@ class Passwall2Manager:
         try:
             logger.info(f"Creating ACL rule for client {client_ip} using node {node_section}")
 
-            # Remove any existing ACL rules for this client (without restart)
+            # Validate the node exists before we wire an ACL to it. If the
+            # caller passed an empty/invalid section we must abort — otherwise
+            # passwall2 will silently drop the orphan ACL and traffic will
+            # bypass the proxy entirely.
+            if not node_section or not self.section_exists(node_section):
+                logger.error(f"Refusing to create ACL: node section '{node_section}' does not exist")
+                return False
+
+            # Remove any existing ACL rules for this client (without restart).
+            # Pass the new node as protected so we don't accidentally delete it
+            # when the user re-applies the same proxy URL (add_proxy_node dedupes
+            # and returns the existing section).
             logger.info(f"Removing existing ACL rules for {client_ip}")
-            self.remove_client_proxy_rule(client_ip, restart_service=False)
+            self.remove_client_proxy_rule(client_ip, restart_service=False,
+                                           protected_nodes={node_section})
 
             # Small delay to ensure cleanup is complete
             time.sleep(1)
@@ -412,8 +424,15 @@ class Passwall2Manager:
             logger.error(f"Error removing node {section_name}: {e}")
             return False
 
-    def remove_client_proxy_rule(self, client_ip: str, restart_service: bool = True) -> bool:
-        """Remove ACL rule(s) for client and delete unused nodes it referenced."""
+    def remove_client_proxy_rule(self, client_ip: str, restart_service: bool = True,
+                                  protected_nodes: Optional[set] = None) -> bool:
+        """Remove ACL rule(s) for client and delete unused nodes it referenced.
+
+        protected_nodes: section names that must NOT be deleted even if they
+        appear unused after ACL removal (e.g. the node we're about to re-attach
+        in set_client_proxy_rule).
+        """
+        protected_nodes = protected_nodes or set()
         try:
             logger.info(f"=== Removing proxy rules for client: {client_ip} ===")
             cfg = self.run_uci_command(['show', self.config_name])
@@ -468,8 +487,8 @@ class Passwall2Manager:
             still_used = self._nodes_in_use()
 
             # Remove nodes that are only referenced by the deleted ACL rules
-            nodes_to_remove = candidate_nodes - still_used
-            logger.info(f"Nodes to remove: {nodes_to_remove}")
+            nodes_to_remove = candidate_nodes - still_used - protected_nodes
+            logger.info(f"Nodes to remove: {nodes_to_remove} (protected: {protected_nodes})")
 
             for node in nodes_to_remove:
                 if node:
