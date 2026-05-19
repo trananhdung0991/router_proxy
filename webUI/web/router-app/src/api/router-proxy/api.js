@@ -74,3 +74,54 @@ export function restartService() {
     timeout: 20000
   })
 }
+
+// === Software update ===
+
+export function getSystemVersion() {
+  return xrequest({
+    url: '/system/version',
+    method: 'get',
+    timeout: 10000
+  })
+}
+
+export function checkUpdate() {
+  return xrequest({
+    url: '/system/update/check',
+    method: 'get',
+    timeout: 20000
+  })
+}
+
+export function listUpdateVersions() {
+  return xrequest({
+    url: '/system/update/versions',
+    method: 'get',
+    timeout: 20000
+  })
+}
+
+export function applyUpdate(version) {
+  return xrequest({
+    url: '/system/update/apply',
+    method: 'post',
+    data: version ? { version } : {},
+    timeout: 15000
+  })
+}
+
+export function getUpdateStatus() {
+  return xrequest({
+    url: '/system/update/status',
+    method: 'get',
+    timeout: 10000
+  })
+}
+
+export function rollbackUpdate() {
+  return xrequest({
+    url: '/system/update/rollback',
+    method: 'post',
+    timeout: 30000
+  })
+}

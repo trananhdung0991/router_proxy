@@ -67,8 +67,8 @@ pip3 install flask flask-cors psutil
 
 ### Copy Application
 ```bash
-mkdir -p /root/router_proxy
-cp -r * /root/router_proxy/
+mkdir -p /root/router
+cp -r * /root/router/
 ```
 
 ### Install Service
@@ -117,7 +117,7 @@ logread -f | grep router_proxy
 
 ### Manual start (for debugging)
 ```bash
-cd /root/router_proxy
+cd /root/router
 python3 main.py
 ```
 
@@ -126,7 +126,7 @@ python3 main.py
 ```bash
 /etc/init.d/router_proxy stop
 /etc/init.d/router_proxy disable
-rm -rf /root/router_proxy
+rm -rf /root/router
 rm -rf /www/router-app
 rm /etc/init.d/router_proxy
 uci delete uhttpd.router_app
@@ -134,7 +134,7 @@ uci commit uhttpd
 /etc/init.d/uhttpd restart
 ```
 
-## Update Deployment
+## Update Deployment (manual)
 
 ```bash
 # On PC
@@ -145,7 +145,53 @@ scp -r install_package root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 /etc/init.d/router_proxy stop
 cd /tmp/install_package
-cp -r router pyarmor_runtime_005235 main.py resource_path.py /root/router_proxy/
+cp -r router pyarmor_runtime_005235 main.py resource_path.py VERSION /root/router/
 cp -r web/* /www/router-app/
 /etc/init.d/router_proxy start
+```
+
+## OTA Update (online, via license server)
+
+Routers self-update by pulling signed packages from the license server.
+
+### Publish a new release (from build PC)
+
+1. Bump the `VERSION` file at the repo root (e.g. `0.2.0` → `0.2.1`).
+2. Build with the signing key (must match the server's `UPDATE_SIGNING_KEY`):
+   ```bash
+   UPDATE_SIGNING_KEY=<shared-secret> bash build.sh
+   ```
+   Produces `dist/router_proxy-<version>.tar.gz` + `.manifest.json` + `.sha256`.
+3. Publish to the license server:
+   ```bash
+   ADMIN_TOKEN=<admin-token> bash scripts/publish_package.sh
+   # or specify version + server explicitly:
+   ADMIN_TOKEN=<admin-token> bash scripts/publish_package.sh 0.2.1 https://routerlic.xproxy.io
+   ```
+
+### Server requirements
+
+- Reinstall / restart the license server so the new `packages` table and routes exist.
+- The systemd unit must export `UPDATE_SIGNING_KEY` and `PACKAGES_DIR` (see `server_lic/install_service.sh`).
+- nginx must allow large bodies (`client_max_body_size 256m;`) — already configured in `server_lic/nginx.conf`.
+
+### Router-side requirements
+
+- `/root/router/VERSION` and `/root/router/UPDATE_SIGNING_KEY` must exist (shipped by `install.sh` when `UPDATE_SIGNING_KEY` was passed to `build.sh`).
+- A valid license must be present.
+
+### End-user flow
+
+Open Web UI → **System Information** → **Software Update** card:
+- **Check for updates** queries `GET /system/update/check`.
+- **Update to latest** or pick from the dropdown then **Install selected** triggers `POST /system/update/apply`, which downloads, verifies (SHA-256 + HMAC), atomically swaps `/root/router` (keeping `/root/router.bak`) and `/www/router-app`, then restarts the service.
+- **Rollback to previous** restores the `.bak` directories.
+
+### Manual verification
+
+```bash
+curl http://<router>:8080/system/version
+curl http://<router>:8080/system/update/check
+curl -X POST http://<router>:8080/system/update/apply
+watch -n1 'curl -s http://<router>:8080/system/update/status'
 ```

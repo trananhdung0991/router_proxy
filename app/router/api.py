@@ -13,6 +13,7 @@ from flask_cors import CORS, cross_origin
 from router.passwall2 import Passwall2Manager
 from router.openwrt_router import OpenWrtRouterManager
 from router.license import get_license_manager
+from router import updater
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,11 @@ def web_linux_resource_config():
     # check new version every 30m
     data = {}
     data = LinuxUtil().get_linux_resource()
-    data['version'] = '0.1'
+    try:
+        from router import updater as _u
+        data['version'] = _u.get_current_version() or '0.0.0'
+    except Exception:
+        data['version'] = '0.0.0'
     return jsonify({'status': True, 'data': data})
 
 @app.route('/v2/footer_ads', methods=['GET'])
@@ -934,6 +939,98 @@ def dashboard_port80_disable():
         return jsonify({"success": True, "message": "Dashboard port 80 disabled"})
     except Exception as e:
         logger.error(f"Error disabling dashboard port 80: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# === OTA software update ====================================================
+
+def _require_license_or_403():
+    lm = get_license_manager()
+    lm.check_license()
+    if not lm.is_license_valid():
+        return jsonify({"success": False, "error": "Valid license required"}), 403
+    return None
+
+
+@app.route('/system/version', methods=['GET'])
+@cross_origin()
+def system_version():
+    return jsonify({
+        "success": True,
+        "current": updater.get_current_version(),
+        "channel": "stable",
+        "has_backup": os.path.isdir("/root/router.bak"),
+    })
+
+
+@app.route('/system/update/check', methods=['GET'])
+@cross_origin()
+def system_update_check():
+    err = _require_license_or_403()
+    if err: return err
+    try:
+        manifest = updater.check_update()
+        current = updater.get_current_version()
+        latest = (manifest or {}).get("version")
+        return jsonify({
+            "success": True,
+            "current": current,
+            "latest": latest,
+            "update_available": bool(latest and latest != current),
+            "manifest": manifest,
+        })
+    except Exception as e:
+        logger.error(f"update check failed: {e}")
+        return jsonify({"success": False, "message": str(e)}), 502
+
+
+@app.route('/system/update/versions', methods=['GET'])
+@cross_origin()
+def system_update_versions():
+    err = _require_license_or_403()
+    if err: return err
+    try:
+        data = updater.list_versions()
+        return jsonify({"success": True, **(data if isinstance(data, dict) else {"versions": data})})
+    except Exception as e:
+        logger.error(f"list versions failed: {e}")
+        return jsonify({"success": False, "message": str(e)}), 502
+
+
+@app.route('/system/update/apply', methods=['POST'])
+@cross_origin()
+def system_update_apply():
+    err = _require_license_or_403()
+    if err: return err
+    try:
+        data = request.get_json(silent=True) or {}
+        version = data.get("version")
+        ok, msg = updater.apply_update_async(version)
+        status = updater.get_state()
+        if not ok:
+            return jsonify({"success": False, "message": msg, "state": status}), 409
+        return jsonify({"success": True, "message": msg, "state": status}), 202
+    except Exception as e:
+        logger.error(f"apply update failed: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/system/update/status', methods=['GET'])
+@cross_origin()
+def system_update_status():
+    return jsonify({"success": True, "state": updater.get_state()})
+
+
+@app.route('/system/update/rollback', methods=['POST'])
+@cross_origin()
+def system_update_rollback():
+    err = _require_license_or_403()
+    if err: return err
+    try:
+        ok, msg = updater.rollback()
+        return jsonify({"success": ok, "message": msg, "state": updater.get_state()}), (200 if ok else 409)
+    except Exception as e:
+        logger.error(f"rollback failed: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 

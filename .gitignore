@@ -8,6 +8,10 @@ venv/
 # PyArmor build output
 app/dist/
 
+# OTA build outputs
+dist/
+dist_unobf/
+
 # Install package
 install_package/
 
@@ -34,3 +38,4 @@ server_lic/ssl/
 
 # package-lock (optional — remove if you want to track it)
 package-lock.json
+.update_signing_key

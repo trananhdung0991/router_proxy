@@ -25,6 +25,16 @@ if [ -z "$ADMIN_TOKEN" ]; then
     echo ""
 fi
 
+# Generate update signing key if not provided (must match the key baked into
+# /root/router/UPDATE_SIGNING_KEY on each router)
+if [ -z "$UPDATE_SIGNING_KEY" ]; then
+    echo "Generating random UPDATE_SIGNING_KEY..."
+    UPDATE_SIGNING_KEY=$(openssl rand -hex 32)
+    echo "Generated UPDATE_SIGNING_KEY: $UPDATE_SIGNING_KEY"
+    echo "IMPORTANT: Save this — same value must be passed to build.sh on every release."
+    echo ""
+fi
+
 # Install Python dependencies
 echo "Installing Python dependencies..."
 apt-get update >/dev/null 2>&1
@@ -47,6 +57,9 @@ mkdir -p "$INSTALL_DIR"
 echo "Copying files..."
 cp "$SCRIPT_DIR/license_server.py" "$INSTALL_DIR/"
 chmod 644 "$INSTALL_DIR/license_server.py"
+
+# Create packages directory for OTA tarballs
+mkdir -p "$INSTALL_DIR/packages"
 
 # Create www-data user if doesn't exist
 if ! id -u www-data >/dev/null 2>&1; then
@@ -71,6 +84,8 @@ User=www-data
 Group=www-data
 WorkingDirectory=$INSTALL_DIR
 Environment="ADMIN_TOKEN=$ADMIN_TOKEN"
+Environment="UPDATE_SIGNING_KEY=$UPDATE_SIGNING_KEY"
+Environment="PACKAGES_DIR=$INSTALL_DIR/packages"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/license_server.py
 Restart=always
